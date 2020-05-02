@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 )
@@ -15,9 +16,13 @@ const lineBreak = "\r\n"
 //SMTPServer provides basic implementation of the Simple Mail Transfer Protocol that holds the emails in memory instead
 //of sending them to the recipients. Used during development/integration testing of an app
 type SMTPServer struct {
-	Addr     string
-	Hostname string
-	Emails   []EmailMessage
+	Addres      string
+	Hostname    string
+	listener    net.Listener
+	emails      []EmailMessage
+	emailsMutex sync.Mutex
+	stop        chan bool
+	stopped     chan bool
 }
 
 //EmailMessage represents an email received by the SMTP server
@@ -28,36 +33,68 @@ type EmailMessage struct {
 	Data       string
 }
 
-//ListenAndServe creates a new listener and accepts SMTP traffic
-func (server *SMTPServer) ListenAndServe() error {
-	addr := server.Addr
+//NewServer creates and starts a SMTPServer
+func NewServer(addr string, host string) (*SMTPServer, error) {
 	if addr == "" {
 		addr = ":25"
 	}
 
 	lnr, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer lnr.Close()
 
-	return server.Serve(lnr)
+	server := SMTPServer{
+		Addres:      addr,
+		Hostname:    host,
+		listener:    lnr,
+		emails:      []EmailMessage{},
+		emailsMutex: sync.Mutex{},
+		stop:        make(chan bool),
+		stopped:     make(chan bool),
+	}
+	go server.serve(lnr)
+
+	return &server, nil
 }
 
-//Serve uses an existing listener and accepts SMTP traffic
-func (server *SMTPServer) Serve(lnr net.Listener) error {
+//Stop terminates the SMTPServer
+func (server *SMTPServer) Stop() {
+	close(server.stop)
+	server.listener.Close()
+	<-server.stopped
+}
+
+//Emails returs the processed emails
+func (server *SMTPServer) Emails() (emails []EmailMessage) {
+	server.emailsMutex.Lock()
+	defer server.emailsMutex.Unlock()
+
+	emails = server.emails
+	return
+}
+
+func (server *SMTPServer) serve(lnr net.Listener) {
+	defer close(server.stopped)
+
 	for {
-		con, err := lnr.Accept()
+		con, err := server.listener.Accept()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				log.Printf("smtpd: Accept error: %v", err)
-				continue
+			select {
+			case <-server.stop:
+				return
+			default:
+				log.Printf("Accept error: %v", err)
+				if ne, ok := err.(net.Error); ok && ne.Temporary() {
+					continue
+				}
+				return
 			}
-			return err
 		}
 
 		session, err := server.newSession(con)
 		if err != nil {
+			log.Printf("Error creating new SMTP session: %v", err)
 			continue
 		}
 
@@ -74,6 +111,13 @@ func (server *SMTPServer) newSession(con net.Conn) (session *smtpSession, err er
 	}
 
 	return
+}
+
+func (server *SMTPServer) addEmail(email EmailMessage) {
+	server.emailsMutex.Lock()
+	defer server.emailsMutex.Unlock()
+
+	server.emails = append(server.emails, email)
 }
 
 type smtpSession struct {
@@ -96,7 +140,7 @@ func (session *smtpSession) serve() {
 		}
 
 		cmd := smtpCommand(msg)
-		switch cmd.getCmd() {
+		switch cmd.getVerb() {
 		case "HELO":
 			session.semdMsg("250 %s SmtpMoq server responding", session.server.Hostname)
 		case "EHLO":
@@ -131,7 +175,7 @@ func (session *smtpSession) serve() {
 			}
 
 			receivedEmail.GUID = uuid.New()
-			session.server.Emails = append(session.server.Emails, receivedEmail) //TODO: Resolve the race condition
+			session.server.addEmail(receivedEmail)
 			session.send250OkWithBody("queued as " + receivedEmail.GUID.String())
 		case "VRFY":
 			session.send250OkWithBody(cmd.getCmdPayload())
@@ -177,7 +221,7 @@ func (session *smtpSession) errorf(format string, args ...interface{}) {
 
 type smtpCommand string
 
-func (cmd smtpCommand) getCmd() string {
+func (cmd smtpCommand) getVerb() string {
 	c := strings.ToUpper(string(cmd))
 	if cidx := strings.Index(c, ":"); cidx > 0 {
 		return c[:cidx]
@@ -195,7 +239,7 @@ func (cmd smtpCommand) getCmd() string {
 }
 
 func (cmd smtpCommand) getCmdPayload() string {
-	c := cmd.getCmd()
+	c := cmd.getVerb()
 	if len(cmd) == len(c) {
 		return ""
 	}
